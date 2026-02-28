@@ -136,13 +136,12 @@ class FTPLogWatcher:
             ftp = self._ftp_connect()
             files = []
             ftp.retrlines('LIST', files.append)
-            adm_files = [line.split()[-1] for line in files if line.lower().endswith('.adm')]
+            adm_files = [line.split()[-1] for line in files if line.lower().endswith(('.adm', '.log', '.rpt'))]
             ftp.quit()
 
             if not adm_files:
                 return []
 
-            # Najnowszy plik (zakładamy sortowanie alfabetyczne odwrotne = najnowszy)
             latest = sorted(adm_files, reverse=True)[0]
 
             if latest != self.last_file:
@@ -173,10 +172,39 @@ class FTPLogWatcher:
         while True:
             lines = await self.get_new_lines()
             for line in lines:
+                # Rozszerzone dopasowania formatów czatu
+                
+                # 1. Standard DayZ adminlog: HH:MM:SS | Chat("Nick"): wiadomość
                 m = re.match(r'^(\d{2}:\d{2}:\d{2}) \| Chat\("([^"]+)"\): (.+)$', line)
+                
+                # 2. Z dodatkowymi danymi po nicku (id=..., steamID=..., guid=...)
+                if not m:
+                    m = re.match(r'^(\d{2}:\d{2}:\d{2}) \| Chat\("([^"]+)"(?:\s*\([^)]+\))?\): (.+)$', line)
+                
+                # 3. Format z kanałem: [Global]/[Direct]/[Group] Nick: wiadomość
+                if not m:
+                    m = re.match(r'^(\d{2}:\d{2}:\d{2}) \| \[(Global|Direct|Group|Side|Vehicle)\] ([^:]+): (.+)$', line)
+                    if m:
+                        t, channel, nick, msg = m.groups()
+                        await callback(f"[{t}] **{nick}** ({channel}): {msg}")
+                        continue
+                
+                # 4. Prosty wariant bez "Chat": HH:MM:SS | Nick: wiadomość
+                if not m:
+                    m = re.match(r'^(\d{2}:\d{2}:\d{2}) \| ([^:]+): (.+)$', line)
+                
+                # 5. Czasem bez pipe'a po czasie: HH:MM:SS Chat Nick: wiadomość
+                if not m:
+                    m = re.match(r'^(\d{2}:\d{2}:\d{2}) Chat "([^"]+)": (.+)$', line)
+                
                 if m:
-                    t, nick, msg = m.groups()
-                    await callback(f"[{t}] **{nick}**: {msg}")
+                    if len(m.groups()) == 3:
+                        t, nick, msg = m.groups()
+                        await callback(f"[{t}] **{nick}**: {msg}")
+                    elif len(m.groups()) == 4:
+                        t, channel, nick, msg = m.groups()
+                        await callback(f"[{t}] **{nick}** ({channel}): {msg}")
+            
             await asyncio.sleep(CHECK_INTERVAL)
 
 # ────────────────────────────────────────────────

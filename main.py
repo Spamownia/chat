@@ -11,6 +11,10 @@ from ftplib import FTP
 import io
 import pickle
 
+# Flask – wymagany przez Render Web Service
+from flask import Flask
+from threading import Thread
+
 # Zmienne środowiskowe
 RCON_HOST       = os.getenv('RCON_HOST')
 RCON_PORT       = int(os.getenv('RCON_PORT', '2302'))
@@ -219,6 +223,27 @@ async def on_message(message):
 @bot.event
 async def on_disconnect():
     await rcon.close()
+
+# ────────────────────────────────────────────────
+# Flask – minimalny serwer HTTP żeby Render nie wyłączał instancji
+# ────────────────────────────────────────────────
+
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "DayZ chat relay bot is running"
+
+@app.route('/health')
+def health():
+    return "OK", 200
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+
+# Uruchamiamy Flask w osobnym wątku
+Thread(target=run_flask, daemon=True).start()
 
 # ────────────────────────────────────────────────
 

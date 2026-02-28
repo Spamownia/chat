@@ -1,0 +1,4 @@
+# requirements.txt
+
+discord.py==2.4.0
+aiohttp==3.9.5          # wymagane przez discord.py w nowszych wersjach

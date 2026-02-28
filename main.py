@@ -2,14 +2,16 @@ import os
 import asyncio
 import discord
 from discord.ext import commands
+import socket
+import struct
+import hashlib
+import binascii
+import re
 from ftplib import FTP
 import io
-import re
-import hashlib
 import pickle
-import socket
 
-# Environment variables
+# Zmienne środowiskowe
 RCON_HOST       = os.getenv('RCON_HOST')
 RCON_PORT       = int(os.getenv('RCON_PORT', '2302'))
 RCON_PASSWORD   = os.getenv('RCON_PASSWORD')
@@ -19,61 +21,66 @@ DISCORD_CHANNEL_ID = int(os.getenv('DISCORD_CHANNEL_ID'))
 BOT_PREFIX       = os.getenv('BOT_PREFIX', '!')
 
 FTP_HOST        = os.getenv('FTP_HOST')
-FTP_PORT        = int(os.getenv('FTP_PORT', '21'))          # ← DODANE
+FTP_PORT        = int(os.getenv('FTP_PORT', '21'))
 FTP_USER        = os.getenv('FTP_USER')
 FTP_PASS        = os.getenv('FTP_PASS')
-FTP_DIR         = os.getenv('FTP_DIR', '/adm_logs/')        # lub '/'
-CHECK_INTERVAL  = int(os.getenv('CHECK_INTERVAL', '10'))    # sekundy
+FTP_DIR         = os.getenv('FTP_DIR', '/')
 
-STATE_FILE = 'log_state.pkl'
+CHECK_INTERVAL  = int(os.getenv('CHECK_INTERVAL', '12'))   # co ile sekund sprawdzać nowe linie
+
+STATE_FILE = 'last_log_state.pkl'
 
 # ────────────────────────────────────────────────
-# RCON (tylko wysyłanie – bez odbierania logów)
+# RCON – tylko wysyłanie wiadomości
 # ────────────────────────────────────────────────
 
 class RCONClient:
-    def __init__(self, host, port, password):
-        self.host = host
-        self.port = port
-        self.password = password
+    def __init__(self):
         self.sock = None
         self.connected = False
         self.packet_counter = 0
 
-    async def connect(self):
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.settimeout(5)
-        try:
-            self.sock.connect((self.host, self.port))
-            login_packet = self.build_packet(b'\x00' + hashlib.md5(self.password.encode()).digest())
-            self.sock.send(login_packet)
-            response = self.sock.recv(1024)
-            if len(response) < 8 or response[7] != 1:
-                raise Exception("RCON login failed")
-            self.connected = True
-            print("RCON connected")
-        except Exception as e:
-            print(f"RCON connect failed: {e}")
-            self.connected = False
-
-    def build_packet(self, data):
-        import struct
-        import binascii
+    def _build_packet(self, data):
         self.packet_counter = (self.packet_counter + 1) % 256
         packet = b'\xFF' + struct.pack('<B', self.packet_counter) + data
         crc = struct.pack('<I', binascii.crc32(packet) & 0xffffffff)
         return b'BE' + crc + packet
 
-    async def send_command(self, command):
-        if not self.connected:
+    async def connect(self):
+        if not RCON_HOST or not RCON_PASSWORD:
+            print("Brak RCON_HOST lub RCON_PASSWORD – pomijam RCON")
             return
-        cmd_packet = self.build_packet(b'\x01' + command.encode('utf-8', errors='ignore'))
+
         try:
-            self.sock.send(cmd_packet)
-        except:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.settimeout(6)
+            self.sock.connect((RCON_HOST, RCON_PORT))
+            
+            login_data = b'\x00' + hashlib.md5(RCON_PASSWORD.encode()).digest()
+            pkt = self._build_packet(login_data)
+            self.sock.send(pkt)
+            
+            resp = self.sock.recv(1024)
+            if len(resp) < 8 or resp[7] != 1:
+                raise Exception("Logowanie RCON nieudane")
+                
+            self.connected = True
+            print("RCON połączony")
+        except Exception as e:
+            print(f"RCON connect error: {e}")
             self.connected = False
 
-    async def disconnect(self):
+    async def send(self, command: str):
+        if not self.connected or not self.sock:
+            return
+        try:
+            pkt = self._build_packet(b'\x01' + command.encode('utf-8', errors='replace'))
+            self.sock.send(pkt)
+        except Exception as e:
+            print(f"RCON send error: {e}")
+            self.connected = False
+
+    async def close(self):
         if self.sock:
             try:
                 self.sock.close()
@@ -85,145 +92,133 @@ class RCONClient:
 # Czytanie logów z FTP
 # ────────────────────────────────────────────────
 
-class FTPLogReader:
+class FTPLogWatcher:
     def __init__(self):
-        self.ftp = None
         self.last_file = None
-        self.last_offset = 0
-        self.load_state()
+        self.last_line_count = 0
+        self._load_state()
 
-    def load_state(self):
+    def _load_state(self):
         if os.path.exists(STATE_FILE):
             try:
                 with open(STATE_FILE, 'rb') as f:
-                    state = pickle.load(f)
-                    self.last_file = state.get('last_file')
-                    self.last_offset = state.get('last_offset', 0)
-                print(f"Loaded state: {self.last_file} @ {self.last_offset}")
+                    data = pickle.load(f)
+                    self.last_file = data.get('file')
+                    self.last_line_count = data.get('lines', 0)
             except:
-                print("Cannot load state file – starting fresh")
+                pass
 
-    def save_state(self):
+    def _save_state(self):
         try:
             with open(STATE_FILE, 'wb') as f:
-                pickle.dump({'last_file': self.last_file, 'last_offset': self.last_offset}, f)
-        except Exception as e:
-            print(f"Cannot save state: {e}")
-
-    def _connect(self):
-        self.ftp = FTP()
-        self.ftp.connect(FTP_HOST, FTP_PORT, timeout=10)
-        self.ftp.login(FTP_USER, FTP_PASS)
-        self.ftp.cwd(FTP_DIR)
-
-    def _disconnect(self):
-        try:
-            if self.ftp:
-                self.ftp.quit()
+                pickle.dump({'file': self.last_file, 'lines': self.last_line_count}, f)
         except:
             pass
 
-    async def get_latest_log_file(self):
-        self._connect()
+    def _ftp_connect(self):
+        ftp = FTP()
+        ftp.connect(FTP_HOST, FTP_PORT, timeout=10)
+        ftp.login(FTP_USER, FTP_PASS)
+        if FTP_DIR:
+            ftp.cwd(FTP_DIR)
+        return ftp
+
+    async def get_new_lines(self):
+        if not all([FTP_HOST, FTP_USER, FTP_PASS]):
+            print("Brak danych FTP – pomijam")
+            return []
+
         try:
-            lines = []
-            self.ftp.retrlines('LIST', lines.append)
-            adm_files = []
-            for line in lines:
-                parts = line.split()
-                if len(parts) >= 9 and parts[-1].lower().endswith('.adm'):
-                    adm_files.append(parts[-1])
+            ftp = self._ftp_connect()
+            files = []
+            ftp.retrlines('LIST', files.append)
+            adm_files = [line.split()[-1] for line in files if line.lower().endswith('.adm')]
+            ftp.quit()
+
             if not adm_files:
-                return None
-            adm_files.sort(reverse=True)  # najnowszy na górze (zakładając datę w nazwie)
-            return adm_files[0]
-        finally:
-            self._disconnect()
+                return []
 
-    async def read_new_logs(self):
-        current_file = await self.get_latest_log_file()
-        if not current_file:
-            print("Brak plików .ADM na FTP")
-            return []
+            # Najnowszy plik (zakładamy sortowanie alfabetyczne odwrotne = najnowszy)
+            latest = sorted(adm_files, reverse=True)[0]
 
-        if current_file != self.last_file:
-            print(f"Przełączono na nowy plik logów: {current_file}")
-            self.last_file = current_file
-            self.last_offset = 0
+            if latest != self.last_file:
+                print(f"Nowy plik logów: {latest}")
+                self.last_file = latest
+                self.last_line_count = 0
 
-        self._connect()
-        try:
-            buffer = io.BytesIO()
-            self.ftp.retrbinary(f'RETR {current_file}', buffer.write)
-            buffer.seek(0)
-            content = buffer.read().decode('utf-8', errors='replace')
-            lines = content.splitlines(True)  # zachowujemy \n
+            ftp = self._ftp_connect()
+            buf = io.BytesIO()
+            ftp.retrbinary(f'RETR {latest}', buf.write)
+            ftp.quit()
 
-            new_lines = lines[self.last_offset:]
-            self.last_offset = len(lines)
-            self.save_state()
+            buf.seek(0)
+            content = buf.read().decode('utf-8', errors='replace')
+            lines = content.splitlines()
 
-            return [line.rstrip('\r\n') for line in new_lines if line.strip()]
+            new_lines = lines[self.last_line_count:]
+            self.last_line_count = len(lines)
+            self._save_state()
+
+            return [line.strip() for line in new_lines if line.strip()]
+
         except Exception as e:
-            print(f"Błąd pobierania logu {current_file}: {e}")
+            print(f"Błąd FTP: {e}")
             return []
-        finally:
-            self._disconnect()
 
-    async def process_logs(self):
+    async def run(self, callback):
         while True:
-            try:
-                new_lines = await self.read_new_logs()
-                for line in new_lines:
-                    # Typowy format chatu w DayZ (możesz dostosować regex)
-                    m = re.match(r'^(\d{2}:\d{2}:\d{2}) \| Chat\("([^"]+)"\): (.+)$', line.strip())
-                    if m:
-                        czas, gracz, wiadomosc = m.groups()
-                        msg = f"[{czas}] **{gracz}**: {wiadomosc}"
-                        await send_to_discord(msg)
-            except Exception as e:
-                print(f"Błąd w pętli logów: {e}")
+            lines = await self.get_new_lines()
+            for line in lines:
+                m = re.match(r'^(\d{2}:\d{2}:\d{2}) \| Chat\("([^"]+)"\): (.+)$', line)
+                if m:
+                    t, nick, msg = m.groups()
+                    await callback(f"[{t}] **{nick}**: {msg}")
             await asyncio.sleep(CHECK_INTERVAL)
 
 # ────────────────────────────────────────────────
-# Discord
+# Discord bot
 # ────────────────────────────────────────────────
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix=BOT_PREFIX, intents=intents)
 
-rcon = RCONClient(RCON_HOST, RCON_PORT, RCON_PASSWORD)
-ftp_reader = FTPLogReader()
+rcon = RCONClient()
+watcher = FTPLogWatcher()
 
-async def send_to_discord(message: str):
+async def send_chat_to_discord(text: str):
     channel = bot.get_channel(DISCORD_CHANNEL_ID)
     if channel:
         try:
-            await channel.send(message)
-        except:
-            print("Nie udało się wysłać wiadomości na Discord")
+            await channel.send(text)
+        except Exception as e:
+            print(f"Nie udało się wysłać na Discord: {e}")
 
 @bot.event
 async def on_ready():
     print(f"Zalogowano jako {bot.user}")
     await rcon.connect()
-    asyncio.create_task(ftp_reader.process_logs())
+    asyncio.create_task(watcher.run(send_chat_to_discord))
 
 @bot.event
 async def on_message(message):
     if message.author.bot:
         return
-    if message.channel.id == DISCORD_CHANNEL_ID:
-        content = message.content.strip()
-        if content:
-            dayz_msg = f"{message.author.display_name}: {content}"
-            await rcon.send_command(f'say -1 "{dayz_msg}"')
+    if message.channel.id != DISCORD_CHANNEL_ID:
+        return
+
+    content = message.content.strip()
+    if not content:
+        return
+
+    msg = f"{message.author.display_name}: {content}"
+    await rcon.send(f'say -1 "{msg}"')
+
     await bot.process_commands(message)
 
 @bot.event
 async def on_disconnect():
-    await rcon.disconnect()
+    await rcon.close()
 
 # ────────────────────────────────────────────────
 
@@ -231,7 +226,7 @@ async def main():
     try:
         await bot.start(DISCORD_TOKEN)
     finally:
-        await rcon.disconnect()
+        await rcon.close()
 
 if __name__ == "__main__":
     asyncio.run(main())

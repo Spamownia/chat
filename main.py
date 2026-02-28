@@ -136,12 +136,13 @@ class FTPLogWatcher:
             ftp = self._ftp_connect()
             files = []
             ftp.retrlines('LIST', files.append)
-            adm_files = [line.split()[-1] for line in files if line.lower().endswith(('.adm', '.log', '.rpt'))]
+            adm_files = [line.split()[-1] for line in files if line.lower().endswith('.adm')]
             ftp.quit()
 
             if not adm_files:
                 return []
 
+            # Najnowszy plik (zakładamy sortowanie alfabetyczne odwrotne = najnowszy)
             latest = sorted(adm_files, reverse=True)[0]
 
             if latest != self.last_file:
@@ -172,39 +173,33 @@ class FTPLogWatcher:
         while True:
             lines = await self.get_new_lines()
             for line in lines:
-                # Rozszerzone dopasowania formatów czatu
-                
-                # 1. Standard DayZ adminlog: HH:MM:SS | Chat("Nick"): wiadomość
-                m = re.match(r'^(\d{2}:\d{2}:\d{2}) \| Chat\("([^"]+)"\): (.+)$', line)
-                
-                # 2. Z dodatkowymi danymi po nicku (id=..., steamID=..., guid=...)
-                if not m:
-                    m = re.match(r'^(\d{2}:\d{2}:\d{2}) \| Chat\("([^"]+)"(?:\s*\([^)]+\))?\): (.+)$', line)
-                
-                # 3. Format z kanałem: [Global]/[Direct]/[Group] Nick: wiadomość
-                if not m:
-                    m = re.match(r'^(\d{2}:\d{2}:\d{2}) \| \[(Global|Direct|Group|Side|Vehicle)\] ([^:]+): (.+)$', line)
-                    if m:
-                        t, channel, nick, msg = m.groups()
-                        await callback(f"[{t}] **{nick}** ({channel}): {msg}")
-                        continue
-                
-                # 4. Prosty wariant bez "Chat": HH:MM:SS | Nick: wiadomość
-                if not m:
-                    m = re.match(r'^(\d{2}:\d{2}:\d{2}) \| ([^:]+): (.+)$', line)
-                
-                # 5. Czasem bez pipe'a po czasie: HH:MM:SS Chat Nick: wiadomość
-                if not m:
-                    m = re.match(r'^(\d{2}:\d{2}:\d{2}) Chat "([^"]+)": (.+)$', line)
-                
+                # Poprawiony parser – obsługuje format z podanego logu: HH:MM:SS | [Chat - Global]("NICK"(id=ID)): wiadomość
+                m = re.match(r'^(\d{2}:\d{2}:\d{2}) \| \[Chat - (Global|Direct|Group|Side|Vehicle)\]\("([^"]+)"(?:\s*\(id=[^\)]+\))?\): (.+)$', line)
                 if m:
-                    if len(m.groups()) == 3:
-                        t, nick, msg = m.groups()
-                        await callback(f"[{t}] **{nick}**: {msg}")
-                    elif len(m.groups()) == 4:
-                        t, channel, nick, msg = m.groups()
-                        await callback(f"[{t}] **{nick}** ({channel}): {msg}")
-            
+                    t, channel, nick, msg = m.groups()
+                    await callback(f"[{t}] **{nick}** ({channel}): {msg}")
+                    continue
+
+                # Wariant bez kanału w nawiasie kwadratowym
+                m = re.match(r'^(\d{2}:\d{2}:\d{2}) \| Chat\("([^"]+)"(?:\s*\(id=[^\)]+\))?\): (.+)$', line)
+                if m:
+                    t, nick, msg = m.groups()
+                    await callback(f"[{t}] **{nick}**: {msg}")
+                    continue
+
+                # Luźny wariant bez "Chat": HH:MM:SS | [Global] Nick: wiadomość
+                m = re.match(r'^(\d{2}:\d{2}:\d{2}) \| \[(Global|Direct|Group|Side|Vehicle)\] ([^:]+): (.+)$', line)
+                if m:
+                    t, channel, nick, msg = m.groups()
+                    await callback(f"[{t}] **{nick}** ({channel}): {msg}")
+                    continue
+
+                # Bardzo prosty: HH:MM:SS | Nick: wiadomość
+                m = re.match(r'^(\d{2}:\d{2}:\d{2}) \| ([^:]+): (.+)$', line)
+                if m:
+                    t, nick, msg = m.groups()
+                    await callback(f"[{t}] **{nick}**: {msg}")
+
             await asyncio.sleep(CHECK_INTERVAL)
 
 # ────────────────────────────────────────────────
@@ -218,44 +213,32 @@ bot = commands.Bot(command_prefix=BOT_PREFIX, intents=intents)
 rcon = RCONClient()
 watcher = FTPLogWatcher()
 
-async def send_chat_to_discord(text: str):
+async def send_to_discord(message):
     channel = bot.get_channel(DISCORD_CHANNEL_ID)
     if channel:
-        try:
-            await channel.send(text)
-        except Exception as e:
-            print(f"Nie udało się wysłać na Discord: {e}")
+        await channel.send(message)
 
 @bot.event
 async def on_ready():
-    print(f"Zalogowano jako {bot.user}")
+    print(f"Discord bot logged in as {bot.user}")
     await rcon.connect()
-    asyncio.create_task(watcher.run(send_chat_to_discord))
+    asyncio.create_task(watcher.run(send_to_discord))
 
 @bot.event
 async def on_message(message):
-    if message.author.bot:
+    if message.author == bot.user:
         return
-    if message.channel.id != DISCORD_CHANNEL_ID:
-        return
-
-    content = message.content.strip()
-    if not content:
-        return
-
-    msg = f"{message.author.display_name}: {content}"
-    await rcon.send(f'say -1 "{msg}"')
-
+    if message.channel.id == DISCORD_CHANNEL_ID:
+        # Relay to DayZ chat using RCON 'say -1 message' (-1 for global)
+        dayz_message = f"{message.author.name}: {message.content}"
+        await rcon.send_command(f"say -1 {dayz_message}")
     await bot.process_commands(message)
 
 @bot.event
 async def on_disconnect():
-    await rcon.close()
+    await rcon.disconnect()
 
-# ────────────────────────────────────────────────
 # Flask – minimalny serwer HTTP żeby Render nie wyłączał instancji
-# ────────────────────────────────────────────────
-
 app = Flask(__name__)
 
 @app.route('/')
@@ -267,19 +250,17 @@ def health():
     return "OK", 200
 
 def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+    port = int(os.getenv('PORT', 10000))
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
-# Uruchamiamy Flask w osobnym wątku
 Thread(target=run_flask, daemon=True).start()
 
-# ────────────────────────────────────────────────
-
+# Run the bot
 async def main():
     try:
         await bot.start(DISCORD_TOKEN)
     finally:
-        await rcon.close()
+        await rcon.disconnect()
 
 if __name__ == "__main__":
     asyncio.run(main())

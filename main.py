@@ -35,7 +35,7 @@ CHECK_INTERVAL  = int(os.getenv('CHECK_INTERVAL', '12'))   # co ile sekund spraw
 STATE_FILE = 'last_log_state.pkl'
 
 # ────────────────────────────────────────────────
-# RCON – wysyłanie wiadomości do gry
+# RCON – tylko wysyłanie wiadomości
 # ────────────────────────────────────────────────
 
 class RCONClient:
@@ -57,7 +57,7 @@ class RCONClient:
 
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.settimeout(6)
+            self.sock.settimeout(5)
             self.sock.connect((RCON_HOST, RCON_PORT))
             
             login_data = b'\x00' + hashlib.md5(RCON_PASSWORD.encode()).digest()
@@ -76,12 +76,10 @@ class RCONClient:
 
     async def send(self, command: str):
         if not self.connected or not self.sock:
-            print("RCON nie jest połączony – nie wysyłamy")
             return
         try:
             pkt = self._build_packet(b'\x01' + command.encode('utf-8', errors='replace'))
             self.sock.send(pkt)
-            print(f"RCON wysłano: {command}")
         except Exception as e:
             print(f"RCON send error: {e}")
             self.connected = False
@@ -111,16 +109,15 @@ class FTPLogWatcher:
                     data = pickle.load(f)
                     self.last_file = data.get('file')
                     self.last_line_count = data.get('lines', 0)
-                print(f"Stan wczytany: plik={self.last_file}, offset={self.last_line_count}")
             except:
-                print("Nie udało się wczytać stanu – start od zera")
+                pass
 
     def _save_state(self):
         try:
             with open(STATE_FILE, 'wb') as f:
                 pickle.dump({'file': self.last_file, 'lines': self.last_line_count}, f)
-        except Exception as e:
-            print(f"Błąd zapisu stanu: {e}")
+        except:
+            pass
 
     def _ftp_connect(self):
         ftp = FTP()
@@ -145,6 +142,7 @@ class FTPLogWatcher:
             if not adm_files:
                 return []
 
+            # Najnowszy plik (zakładamy sortowanie alfabetyczne odwrotne = najnowszy)
             latest = sorted(adm_files, reverse=True)[0]
 
             if latest != self.last_file:
@@ -175,20 +173,16 @@ class FTPLogWatcher:
         while True:
             lines = await self.get_new_lines()
             for line in lines:
-                # Format z Twojego logu: 18:05:56 | [Chat - Global]("MAJKELO"(id=...)): hello...
                 m = re.match(r'^(\d{2}:\d{2}:\d{2}) \| \[Chat - (Global|Direct|Group|Side|Vehicle)\]\("([^"]+)"(?:\s*\(id=[^\)]+\))?\): (.+)$', line)
                 if m:
-                    time, channel, player, msg = m.groups()
-                    discord_msg = f"[{time}] **{player}** ({channel}): {msg}"
-                    await callback(discord_msg)
+                    t, channel, nick, msg = m.groups()
+                    await callback(f"[{t}] **{nick}** ({channel}): {msg}")
                     continue
 
-                # Alternatywny format bez kanału
                 m = re.match(r'^(\d{2}:\d{2}:\d{2}) \| Chat\("([^"]+)"(?:\s*\(id=[^\)]+\))?\): (.+)$', line)
                 if m:
-                    time, player, msg = m.groups()
-                    discord_msg = f"[{time}] **{player}**: {msg}"
-                    await callback(discord_msg)
+                    t, nick, msg = m.groups()
+                    await callback(f"[{t}] **{nick}**: {msg}")
 
             await asyncio.sleep(CHECK_INTERVAL)
 
@@ -203,46 +197,25 @@ bot = commands.Bot(command_prefix=BOT_PREFIX, intents=intents)
 rcon = RCONClient()
 watcher = FTPLogWatcher()
 
-async def send_to_discord(message: str):
+async def send_to_discord(message):
     channel = bot.get_channel(DISCORD_CHANNEL_ID)
     if channel:
-        try:
-            await channel.send(message)
-            print(f"Wysłano na Discord: {message[:80]}...")
-        except Exception as e:
-            print(f"Błąd wysyłki na Discord: {e}")
+        await channel.send(message)
 
 @bot.event
 async def on_ready():
-    print(f"Zalogowano jako {bot.user}")
+    print(f"Discord bot logged in as {bot.user}")
     await rcon.connect()
     asyncio.create_task(watcher.run(send_to_discord))
 
 @bot.event
 async def on_message(message):
-    if message.author.bot:
+    if message.author == bot.user:
         return
-
-    if message.channel.id != DISCORD_CHANNEL_ID:
-        return
-
-    content = message.content.strip()
-    if not content:
-        return
-
-    # Wiadomość z Discorda → gra
-    dayz_message = f"{message.author.display_name}: {content}"
-    command = f'say -1 "{dayz_message}"'
-
-    print(f"Wysyłanie do gry: {command}")
-    await rcon.send(command)
-
-    # Opcjonalnie: reakcja potwierdzająca
-    try:
-        await message.add_reaction("✅")
-    except:
-        pass
-
+    if message.channel.id == DISCORD_CHANNEL_ID:
+        # Relay to DayZ chat using RCON 'say -1 message' (-1 for global)
+        dayz_message = f"{message.author.name}: {message.content}"
+        await rcon.send(f"say -1 {dayz_message}")
     await bot.process_commands(message)
 
 @bot.event
@@ -250,7 +223,7 @@ async def on_disconnect():
     await rcon.close()
 
 # ────────────────────────────────────────────────
-# Flask – żeby Render nie wyłączał instancji
+# Flask – minimalny serwer HTTP żeby Render nie wyłączał instancji
 # ────────────────────────────────────────────────
 
 app = Flask(__name__)
@@ -267,6 +240,7 @@ def run_flask():
     port = int(os.getenv('PORT', 10000))
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
+# Uruchamiamy Flask w osobnym wątku
 Thread(target=run_flask, daemon=True).start()
 
 # ────────────────────────────────────────────────

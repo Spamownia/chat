@@ -30,12 +30,12 @@ FTP_USER        = os.getenv('FTP_USER')
 FTP_PASS        = os.getenv('FTP_PASS')
 FTP_DIR         = os.getenv('FTP_DIR', '/')
 
-CHECK_INTERVAL  = int(os.getenv('CHECK_INTERVAL', '12'))   # co ile sekund sprawdzać nowe linie
+CHECK_INTERVAL  = int(os.getenv('CHECK_INTERVAL', '12'))
 
 STATE_FILE = 'last_log_state.pkl'
 
 # ────────────────────────────────────────────────
-# RCON – tylko wysyłanie wiadomości
+# RCON
 # ────────────────────────────────────────────────
 
 class RCONClient:
@@ -59,15 +59,12 @@ class RCONClient:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.settimeout(6)
             self.sock.connect((RCON_HOST, RCON_PORT))
-            
             login_data = b'\x00' + hashlib.md5(RCON_PASSWORD.encode()).digest()
             pkt = self._build_packet(login_data)
             self.sock.send(pkt)
-            
             resp = self.sock.recv(1024)
             if len(resp) < 8 or resp[7] != 1:
-                raise Exception("Logowanie RCON nieudane")
-                
+                raise Exception("RCON login failed")
             self.connected = True
             print("RCON połączony")
         except Exception as e:
@@ -93,7 +90,7 @@ class RCONClient:
         self.connected = False
 
 # ────────────────────────────────────────────────
-# Czytanie logów z FTP
+# FTP Watcher + debug
 # ────────────────────────────────────────────────
 
 class FTPLogWatcher:
@@ -123,7 +120,7 @@ class FTPLogWatcher:
         ftp = FTP()
         ftp.connect(FTP_HOST, FTP_PORT, timeout=10)
         ftp.login(FTP_USER, FTP_PASS)
-        if FTP_DIR:
+        if FTP_DIR and FTP_DIR != '/':
             ftp.cwd(FTP_DIR)
         return ftp
 
@@ -136,17 +133,17 @@ class FTPLogWatcher:
             ftp = self._ftp_connect()
             files = []
             ftp.retrlines('LIST', files.append)
-            adm_files = [line.split()[-1] for line in files if line.lower().endswith('.adm')]
+            log_files = [line.split()[-1] for line in files if line.lower().endswith(('.adm', '.log', '.rpt'))]
             ftp.quit()
 
-            if not adm_files:
+            if not log_files:
+                print("Brak plików .ADM / .log / .RPT na FTP")
                 return []
 
-            # Najnowszy plik (zakładamy sortowanie alfabetyczne odwrotne = najnowszy)
-            latest = sorted(adm_files, reverse=True)[0]
+            latest = sorted(log_files, reverse=True)[0]
 
             if latest != self.last_file:
-                print(f"Nowy plik logów: {latest}")
+                print(f"Przełączono na nowy plik: {latest}")
                 self.last_file = latest
                 self.last_line_count = 0
 
@@ -166,44 +163,48 @@ class FTPLogWatcher:
             return [line.strip() for line in new_lines if line.strip()]
 
         except Exception as e:
-            print(f"Błąd FTP: {e}")
+            print(f"Błąd FTP: {type(e).__name__}: {str(e)}")
             return []
 
     async def run(self, callback):
         while True:
             lines = await self.get_new_lines()
+            matched = 0
+            unmatched = 0
+
+            if lines:
+                print(f"DEBUG: Pobrano {len(lines)} nowych linii z pliku {self.last_file}")
+                print("DEBUG: pierwsze 8 linii (lub mniej):")
+                for i, ln in enumerate(lines[:8], 1):
+                    print(f"  {i:2d} | {ln}")
+
             for line in lines:
-                # Poprawiony parser – obsługuje format z podanego logu: HH:MM:SS | [Chat - Global]("NICK"(id=ID)): wiadomość
-                m = re.match(r'^(\d{2}:\d{2}:\d{2}) \| \[Chat - (Global|Direct|Group|Side|Vehicle)\]\("([^"]+)"(?:\s*\(id=[^\)]+\))?\): (.+)$', line)
+                # Główny format z Twojego logu
+                m = re.match(r'^(\d{2}:\d{2}:\d{2}) \| \[Chat - (Global|Direct|Group|Side|Vehicle)\]\("([^"]+)"(?:\s*\([^)]+\))?\): (.+)$', line)
                 if m:
                     t, channel, nick, msg = m.groups()
                     await callback(f"[{t}] **{nick}** ({channel}): {msg}")
+                    matched += 1
                     continue
 
-                # Wariant bez kanału w nawiasie kwadratowym
-                m = re.match(r'^(\d{2}:\d{2}:\d{2}) \| Chat\("([^"]+)"(?:\s*\(id=[^\)]+\))?\): (.+)$', line)
-                if m:
-                    t, nick, msg = m.groups()
-                    await callback(f"[{t}] **{nick}**: {msg}")
-                    continue
+                # Alternatywa – bez spacji po id=
+                if not m:
+                    m = re.match(r'^(\d{2}:\d{2}:\d{2}) \| \[Chat - ([^\]]+)\]\("([^"]+)"\(([^)]+)\)\): (.+)$', line)
+                    if m:
+                        t, channel, nick, id_part, msg = m.groups()
+                        await callback(f"[{t}] **{nick}** ({channel}): {msg}")
+                        matched += 1
+                        continue
 
-                # Luźny wariant bez "Chat": HH:MM:SS | [Global] Nick: wiadomość
-                m = re.match(r'^(\d{2}:\d{2}:\d{2}) \| \[(Global|Direct|Group|Side|Vehicle)\] ([^:]+): (.+)$', line)
-                if m:
-                    t, channel, nick, msg = m.groups()
-                    await callback(f"[{t}] **{nick}** ({channel}): {msg}")
-                    continue
+                unmatched += 1
 
-                # Bardzo prosty: HH:MM:SS | Nick: wiadomość
-                m = re.match(r'^(\d{2}:\d{2}:\d{2}) \| ([^:]+): (.+)$', line)
-                if m:
-                    t, nick, msg = m.groups()
-                    await callback(f"[{t}] **{nick}**: {msg}")
+            if matched > 0 or unmatched > 0:
+                print(f"DEBUG: dopasowano {matched} linii chatu, pominięto {unmatched} linii")
 
             await asyncio.sleep(CHECK_INTERVAL)
 
 # ────────────────────────────────────────────────
-# Discord bot
+# Discord
 # ────────────────────────────────────────────────
 
 intents = discord.Intents.default()
@@ -216,29 +217,43 @@ watcher = FTPLogWatcher()
 async def send_to_discord(message):
     channel = bot.get_channel(DISCORD_CHANNEL_ID)
     if channel:
-        await channel.send(message)
+        try:
+            await channel.send(message)
+            print(f"Wysłano na Discord: {message}")
+        except Exception as e:
+            print(f"Błąd wysyłania na Discord: {e}")
 
 @bot.event
 async def on_ready():
-    print(f"Discord bot logged in as {bot.user}")
+    print(f"Zalogowano jako {bot.user}")
     await rcon.connect()
     asyncio.create_task(watcher.run(send_to_discord))
 
 @bot.event
 async def on_message(message):
-    if message.author == bot.user:
+    if message.author.bot:
         return
-    if message.channel.id == DISCORD_CHANNEL_ID:
-        # Relay to DayZ chat using RCON 'say -1 message' (-1 for global)
-        dayz_message = f"{message.author.name}: {message.content}"
-        await rcon.send_command(f"say -1 {dayz_message}")
+    if message.channel.id != DISCORD_CHANNEL_ID:
+        return
+
+    content = message.content.strip()
+    if not content:
+        return
+
+    msg = f"{message.author.display_name}: {content}"
+    await rcon.send(f'say -1 "{msg}"')
+    print(f"Wysłano do gry: {msg}")
+
     await bot.process_commands(message)
 
 @bot.event
 async def on_disconnect():
-    await rcon.disconnect()
+    await rcon.close()
 
-# Flask – minimalny serwer HTTP żeby Render nie wyłączał instancji
+# ────────────────────────────────────────────────
+# Flask
+# ────────────────────────────────────────────────
+
 app = Flask(__name__)
 
 @app.route('/')
@@ -255,12 +270,13 @@ def run_flask():
 
 Thread(target=run_flask, daemon=True).start()
 
-# Run the bot
+# ────────────────────────────────────────────────
+
 async def main():
     try:
         await bot.start(DISCORD_TOKEN)
     finally:
-        await rcon.disconnect()
+        await rcon.close()
 
 if __name__ == "__main__":
     asyncio.run(main())

@@ -12,31 +12,32 @@ from threading import Thread
 from flask import Flask
 
 # ────────────────────────────────────────────────
-# Zmienne środowiskowe (Render / .env)
+# Konfiguracja ze zmiennych środowiskowych
 # ────────────────────────────────────────────────
-RCON_HOST = os.getenv('RCON_HOST')
-RCON_PORT = int(os.getenv('RCON_PORT', '3705'))
-RCON_PASSWORD = os.getenv('RCON_PASSWORD')
-DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
-DISCORD_CHANNEL_ID = int(os.getenv('DISCORD_CHANNEL_ID'))
-BOT_PREFIX = os.getenv('BOT_PREFIX', '!')
-FTP_HOST = os.getenv('FTP_HOST')
-FTP_PORT = int(os.getenv('FTP_PORT', '21'))
-FTP_USER = os.getenv('FTP_USER')
-FTP_PASS = os.getenv('FTP_PASS')
-FTP_DIR = os.getenv('FTP_DIR', '/')
-CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', '10')) # sekundy
+RCON_HOST      = os.getenv('RCON_HOST')
+RCON_PORT      = int(os.getenv('RCON_PORT', '2305'))          # domyślnie 2305 – zmień jeśli u Ciebie inny
+RCON_PASSWORD  = os.getenv('RCON_PASSWORD')
+DISCORD_TOKEN  = os.getenv('DISCORD_TOKEN')
+DISCORD_CHANNEL_ID = int(os.getenv('DISCORD_CHANNEL_ID', '0'))
+BOT_PREFIX     = os.getenv('BOT_PREFIX', '!')
+FTP_HOST       = os.getenv('FTP_HOST')
+FTP_PORT       = int(os.getenv('FTP_PORT', '21'))
+FTP_USER       = os.getenv('FTP_USER')
+FTP_PASS       = os.getenv('FTP_PASS')
+FTP_DIR        = os.getenv('FTP_DIR', '/config/')
+CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', '12'))       # sekundy
+
 STATE_FILE = 'last_log_state.pkl'
 
-print("=== START BOTA ===")
-print(f"RCON: {RCON_HOST or 'BRAK'}:{RCON_PORT} hasło: {'tak' if RCON_PASSWORD else 'NIE'}")
-print(f"FTP: {FTP_HOST or 'BRAK'} user: {FTP_USER or 'BRAK'} katalog: {FTP_DIR}")
-print(f"Discord channel ID: {DISCORD_CHANNEL_ID}")
-print(f"Sprawdzanie logów co: {CHECK_INTERVAL} s")
+print("=== DAYZ ↔ DISCORD RELAY ===")
+print(f"RCON:     {RCON_HOST or 'BRAK'}:{RCON_PORT}  hasło: {'tak' if RCON_PASSWORD else 'NIE'}")
+print(f"FTP:      {FTP_HOST or 'BRAK'}  user: {FTP_USER or 'BRAK'}  dir: {FTP_DIR}")
+print(f"Discord:  channel {DISCORD_CHANNEL_ID}   token: {'obecny' if DISCORD_TOKEN else 'BRAK'}")
+print(f"Interwał: {CHECK_INTERVAL} s")
 print("=" * 60)
 
 # ────────────────────────────────────────────────
-# BattleEye RCON z retry
+# BattleEye RCON
 # ────────────────────────────────────────────────
 class BattleEyeRcon:
     def __init__(self):
@@ -46,13 +47,14 @@ class BattleEyeRcon:
 
     async def connect(self):
         if not RCON_HOST or not RCON_PASSWORD:
-            print("RCON → brak hosta lub hasła → wyłączam")
+            print("RCON → brak hosta lub hasła → pomijam")
             return False
+
         for attempt in range(1, 4):
             print(f"[RCON] Próba {attempt}/3 → {RCON_HOST}:{RCON_PORT}")
             try:
                 self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self.sock.settimeout(10)
+                self.sock.settimeout(8)
                 self.sock.connect((RCON_HOST, RCON_PORT))
                 login_data = RCON_PASSWORD.encode('utf-8') + b'\x00'
                 packet = self._build_packet(0, login_data)
@@ -60,20 +62,15 @@ class BattleEyeRcon:
                 response = self._receive()
                 if response and len(response) >= 9 and response[8] == 0x01:
                     self.connected = True
-                    print("[RCON] POŁĄCZONO POMYŚLNIE ✓")
+                    print("[RCON] POŁĄCZONO ✓")
                     return True
                 else:
-                    print("[RCON] Nieudane logowanie – zła odpowiedź")
+                    print("[RCON] Nieudane logowanie")
             except Exception as e:
-                print(f"[RCON] Błąd połączenia (próba {attempt}): {e}")
-            if self.sock:
-                try:
-                    self.sock.close()
-                except:
-                    pass
-                self.sock = None
-            await asyncio.sleep(5)
-        print("[RCON] WSZYSTKIE PRÓBY NIEUDANE")
+                print(f"[RCON] Błąd (próba {attempt}): {e}")
+            self._close_socket()
+            await asyncio.sleep(4)
+        print("[RCON] Wszystkie próby nieudane")
         return False
 
     def _build_packet(self, pkt_type: int, data: bytes) -> bytes:
@@ -94,7 +91,7 @@ class BattleEyeRcon:
 
     async def send_command(self, command: str) -> bool:
         if not self.connected or not self.sock:
-            print("[RCON] send_command → brak połączenia")
+            print("[RCON] Brak połączenia")
             return False
         try:
             cmd_bytes = command.encode('utf-8', errors='replace') + b'\x00'
@@ -107,7 +104,7 @@ class BattleEyeRcon:
                     msg = resp[9:].decode('utf-8', errors='replace').rstrip('\x00').strip()
                     print(f"[RCON] Odpowiedź seq={seq}: {msg}")
                 except:
-                    print("[RCON] Nie udało się odczytać odpowiedzi")
+                    pass
             print(f"[RCON] Wysłano: {command}")
             return True
         except Exception as e:
@@ -128,8 +125,9 @@ class BattleEyeRcon:
         self._close_socket()
         self.connected = False
 
+
 # ────────────────────────────────────────────────
-# FTP watcher – TYLKO DayZServer_x64_*.adm / *.RPT
+# FTP Log Watcher – tylko .ADM
 # ────────────────────────────────────────────────
 class FTPLogWatcher:
     def __init__(self):
@@ -144,9 +142,9 @@ class FTPLogWatcher:
                     data = pickle.load(f)
                     self.last_file = data.get('file')
                     self.last_line_count = data.get('lines', 0)
-                print(f"[STATE] Wczytano poprzedni stan: {self.last_file} | {self.last_line_count} linii")
+                print(f"[STATE] Wczytano: {self.last_file} | {self.last_line_count} linii")
             except:
-                print("[STATE] Nie udało się wczytać poprzedniego stanu")
+                print("[STATE] Błąd wczytywania stanu")
 
     def _save_state(self):
         try:
@@ -158,43 +156,35 @@ class FTPLogWatcher:
 
     def _ftp_connect(self):
         ftp = FTP()
-        ftp.connect(FTP_HOST, FTP_PORT, timeout=12)
+        ftp.connect(FTP_HOST, FTP_PORT, timeout=10)
         ftp.login(FTP_USER, FTP_PASS)
         if FTP_DIR and FTP_DIR != '/':
             ftp.cwd(FTP_DIR)
-            print(f"[FTP] Przejście do katalogu: {FTP_DIR}")
         return ftp
 
     async def get_new_lines(self):
         if not all([FTP_HOST, FTP_USER, FTP_PASS]):
-            print("[FTP] Brak danych logowania – pomijam")
+            print("[FTP] Brak danych logowania")
             return []
 
         try:
-            print("[FTP] Pobieranie listy plików...")
             ftp = self._ftp_connect()
             files = []
             ftp.retrlines('LIST', files.append)
             ftp.quit()
 
-            # Tylko .ADM (zmiana – ignorujemy .RPT, bo nie mają czatu)
             pattern = re.compile(r'^DayZServer_x64_.*\.adm$', re.IGNORECASE)
             candidates = [line.split()[-1] for line in files if pattern.match(line.split()[-1])]
 
-            print(f"[FTP] Znaleziono {len(candidates)} pasujących plików .ADM")
-            if candidates:
-                print(" " + "\n ".join(candidates[:6]) + (" ..." if len(candidates) > 6 else ""))
-
             if not candidates:
-                print("[FTP] Brak plików DayZServer_x64_*.ADM")
+                print("[FTP] Brak plików .ADM")
                 return []
 
-            # Najnowszy plik – sortowanie odwrotne alfabetyczne (data w nazwie)
-            latest = sorted(candidates, reverse=True)[0]
-            print(f"[FTP] Najnowszy plik: {latest}")
+            latest = max(candidates)   # najnowszy wg nazwy (data w nazwie)
+            print(f"[FTP] Najnowszy: {latest}")
 
             if latest != self.last_file:
-                print(f"[FTP] Przełączono na nowy plik: {latest}")
+                print(f"[FTP] Nowy plik logów: {latest}")
                 self.last_file = latest
                 self.last_line_count = 0
 
@@ -207,18 +197,8 @@ class FTPLogWatcher:
             content = buf.read().decode('utf-8', errors='replace')
             lines = content.splitlines()
 
-            print(f"[FTP] Plik {latest}: {len(lines)} linii ogółem, dotychczas przetworzono {self.last_line_count}")
-
             new_lines = lines[self.last_line_count:]
-            print(f"[FTP] Nowych linii: {len(new_lines)}")
-
-            if new_lines:
-                print("[FTP] Pierwsze 2 nowe:")
-                for line in new_lines[:2]:
-                    print(f" {line}")
-                print("[FTP] Ostatnie 2 nowe:")
-                for line in new_lines[-2:]:
-                    print(f" {line}")
+            print(f"[FTP] {latest}: {len(lines)} linii | nowych: {len(new_lines)}")
 
             self.last_line_count = len(lines)
             self._save_state()
@@ -230,32 +210,27 @@ class FTPLogWatcher:
             return []
 
     async def run(self, callback):
-        print("[Watcher] Start pętli sprawdzania logów...")
+        print("[Watcher] Start monitorowania .ADM...")
         while True:
             lines = await self.get_new_lines()
-            detected = 0
             for line in lines:
-                # Elastyczny regex na czat
+                # Poprawiony regex – pasuje do Twojego przykładu
                 m = re.match(
-                    r'^(\d{2}:\d{2}:\d{2})\s*[|]\s*'
-                    r'(?:Chat\s*(?:-\s*(\w+))?)?\s*'
-                    r'(?:"([^"]+)"(?:\s*\([^)]+\))?)\s*:\s*(.+)$',
+                    r'^(\d{2}:\d{2}:\d{2})\s*\|\s*'
+                    r'\[Chat\s*-\s*(\w+)\]\s*'
+                    r'\("([^"]+)"\s*\([^)]+\)\)\s*:\s*(.+)$',
                     line, re.IGNORECASE
                 )
                 if m:
-                    time, ch_type, nick, msg = m.groups()
-                    ch_type = (ch_type or 'Global').strip()
-                    formatted = f"[{time}] **{nick}** ({ch_type}): {msg.strip()}"
-                    print(f"[CHAT] Wykryto → {formatted}")
+                    time_str, channel_type, nick, msg = m.groups()
+                    formatted = f"[{time_str}] **{nick}** ({channel_type}): {msg.strip()}"
+                    print(f"[CHAT → Discord] {formatted}")
                     await callback(formatted)
-                    detected += 1
-                elif "Chat" in line:
-                    print(f"[CHAT MISS] Linia nie złapana: {line[:140]}")
-
-            if detected > 0:
-                print(f"[Watcher] Przetworzono {detected} wiadomości czatu w tej turze")
+                # elif "Chat" in line:
+                #     print(f"[CHAT MISS] {line[:120]}")   # odkomentuj do debugu
 
             await asyncio.sleep(CHECK_INTERVAL)
+
 
 # ────────────────────────────────────────────────
 # Discord Bot
@@ -263,26 +238,23 @@ class FTPLogWatcher:
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix=BOT_PREFIX, intents=intents)
+
 rcon = BattleEyeRcon()
 watcher = FTPLogWatcher()
 
-async def send_to_discord(msg: str):
+async def send_to_discord(message: str):
     channel = bot.get_channel(DISCORD_CHANNEL_ID)
     if channel:
         try:
-            await channel.send(msg[:2000])
-            print(f"[DISCORD] Wysyłanie: {msg[:80]}{'...' if len(msg)>80 else ''}")
+            await channel.send(message[:1990])
+            print(f"[→ Discord] {message[:80]}{'...' if len(message)>80 else ''}")
         except Exception as e:
-            print(f"[DISCORD] Błąd wysyłania: {e}")
+            print(f"[Discord send error] {e}")
 
 @bot.event
 async def on_ready():
-    print(f"[DISCORD] Bot zalogowany jako {bot.user}")
-    success = await rcon.connect()
-    if success:
-        print("[DISCORD] RCON gotowy do wysyłania")
-    else:
-        print("[DISCORD] RCON NIE DZIAŁA po starcie")
+    print(f"[Discord] Zalogowano jako {bot.user}")
+    await rcon.connect()
     asyncio.create_task(watcher.run(send_to_discord))
 
 @bot.event
@@ -290,40 +262,35 @@ async def on_message(message):
     if message.author.bot:
         return
     if message.channel.id != DISCORD_CHANNEL_ID:
-        await bot.process_commands(message)
-        return
-    if message.content.startswith(BOT_PREFIX):
-        await bot.process_commands(message)
-        return
+        return await bot.process_commands(message)
+
     content = message.clean_content.strip()
     if not content:
         return
+
     safe_msg = content.replace('"', "'").replace('\n', ' ').strip()
     dayz_msg = f"{message.author.display_name}: {safe_msg}"
-    print(f"[DISCORD → DayZ] {dayz_msg}")
+
+    print(f"[Discord → DayZ] {dayz_msg}")
+
     if rcon.connected:
-        success = await rcon.send_command(f"say -1 {dayz_msg}")
-        if success:
-            print("[DISCORD → DayZ] Wysłano pomyślnie")
-        else:
-            await message.reply("⚠ Błąd wysyłania do gry", delete_after=10)
+        success = await rcon.send_command(f'say -1 {dayz_msg}')
+        if not success:
+            await message.reply("⚠ Nie udało się wysłać do gry", delete_after=8)
     else:
-        await message.reply("⚠ RCON nie jest podłączony", delete_after=10)
+        await message.reply("⚠ RCON niepodłączony", delete_after=8)
+
     await bot.process_commands(message)
 
-@bot.event
-async def on_disconnect():
-    print("[DISCORD] Rozłączono")
-    await rcon.close()
 
 # ────────────────────────────────────────────────
-# Flask keep-alive dla Render
+# Flask – keep-alive na Render
 # ────────────────────────────────────────────────
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "DayZ ↔ Discord relay running"
+    return "DayZ ↔ Discord bridge działa"
 
 @app.route('/health')
 def health():
@@ -335,8 +302,9 @@ def run_flask():
 
 Thread(target=run_flask, daemon=True).start()
 
+
 # ────────────────────────────────────────────────
-# Główna pętla
+# Start
 # ────────────────────────────────────────────────
 async def main():
     try:

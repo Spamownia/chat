@@ -177,17 +177,19 @@ class FTPLogWatcher:
             ftp.retrlines('LIST', files.append)
             ftp.quit()
 
-            pattern = re.compile(r'^DayZServer_x64_.*\.(adm|rpt)$', re.IGNORECASE)
+            # Tylko .ADM (zmiana – ignorujemy .RPT, bo nie mają czatu)
+            pattern = re.compile(r'^DayZServer_x64_.*\.adm$', re.IGNORECASE)
             candidates = [line.split()[-1] for line in files if pattern.match(line.split()[-1])]
 
-            print(f"[FTP] Znaleziono {len(candidates)} pasujących plików")
+            print(f"[FTP] Znaleziono {len(candidates)} pasujących plików .ADM")
             if candidates:
                 print(" " + "\n ".join(candidates[:6]) + (" ..." if len(candidates) > 6 else ""))
 
             if not candidates:
-                print("[FTP] Brak plików DayZServer_x64_*.adm / *.RPT")
+                print("[FTP] Brak plików DayZServer_x64_*.ADM")
                 return []
 
+            # Najnowszy plik – sortowanie odwrotne alfabetyczne (data w nazwie)
             latest = sorted(candidates, reverse=True)[0]
             print(f"[FTP] Najnowszy plik: {latest}")
 
@@ -233,26 +235,26 @@ class FTPLogWatcher:
             lines = await self.get_new_lines()
             detected = 0
             for line in lines:
-                # ────────────────────────────────────────────────
-                # Regex dopasowany do aktualnego formatu z .adm:
-                # 14:04:26 | [Chat - Global]("Anu"(id=...)): wiadomość
-                # ────────────────────────────────────────────────
+                # Elastyczny regex na czat
                 m = re.match(
-                    r'^(\d{2}:\d{2}:\d{2})\s*\|\s*\[Chat\s*-\s*([^]]+)\]\("([^"]+)"\([^)]+\)\):\s*(.+)$',
-                    line,
-                    re.IGNORECASE
+                    r'^(\d{2}:\d{2}:\d{2})\s*[|]\s*'
+                    r'(?:Chat\s*(?:-\s*(\w+))?)?\s*'
+                    r'(?:"([^"]+)"(?:\s*\([^)]+\))?)\s*:\s*(.+)$',
+                    line, re.IGNORECASE
                 )
                 if m:
                     time, ch_type, nick, msg = m.groups()
-                    ch_type = ch_type.strip()
+                    ch_type = (ch_type or 'Global').strip()
                     formatted = f"[{time}] **{nick}** ({ch_type}): {msg.strip()}"
                     print(f"[CHAT] Wykryto → {formatted}")
                     await callback(formatted)
                     detected += 1
                 elif "Chat" in line:
                     print(f"[CHAT MISS] Linia nie złapana: {line[:140]}")
+
             if detected > 0:
                 print(f"[Watcher] Przetworzono {detected} wiadomości czatu w tej turze")
+
             await asyncio.sleep(CHECK_INTERVAL)
 
 # ────────────────────────────────────────────────

@@ -12,7 +12,7 @@ from threading import Thread
 from flask import Flask
 
 # ────────────────────────────────────────────────
-# Konfiguracja
+# Konfiguracja ze zmiennych środowiskowych
 # ────────────────────────────────────────────────
 RCON_HOST      = os.getenv('RCON_HOST')
 RCON_PORT      = int(os.getenv('RCON_PORT', '2305'))
@@ -35,7 +35,7 @@ print(f"Discord channel: {DISCORD_CHANNEL_ID}")
 print("=" * 60)
 
 # ────────────────────────────────────────────────
-# TEST POŁĄCZENIA SOCKET (nowa funkcja debug)
+# TEST POŁĄCZENIA SOCKET (debug)
 # ────────────────────────────────────────────────
 async def test_rcon_connection():
     if not RCON_HOST or not RCON_PORT:
@@ -51,7 +51,7 @@ async def test_rcon_connection():
         return True
     except Exception as e:
         print(f"[TEST RCON] ❌ BŁĄD: {type(e).__name__}: {e}")
-        print("   → Najczęstsze przyczyny: firewall hostingu / blokada outbound na Render / zły port")
+        print("   → Najczęstsze przyczyny: firewall hostingu / blokada outbound / zły port")
         return False
 
 # ────────────────────────────────────────────────
@@ -161,19 +161,25 @@ class FTPLogWatcher:
         ftp = FTP()
         ftp.connect(FTP_HOST, FTP_PORT, timeout=10)
         ftp.login(FTP_USER, FTP_PASS)
-        if FTP_DIR and FTP_DIR != '/': ftp.cwd(FTP_DIR)
+        if FTP_DIR and FTP_DIR != '/':
+            ftp.cwd(FTP_DIR)
         return ftp
 
     async def get_new_lines(self):
-        if not all([FTP_HOST, FTP_USER, FTP_PASS]): return []
+        if not all([FTP_HOST, FTP_USER, FTP_PASS]):
+            return []
         try:
             ftp = self._ftp_connect()
             files = []
             ftp.retrlines('LIST', files.append)
             ftp.quit()
 
-            candidates = [line.split()[-1] for line in files if re.match(r'^DayZServer_x64_.*\.adm$', line.split()[-1], re.IGNORECASE)]
-            if not candidates: return []
+            candidates = [
+                line.split()[-1] for line in files
+                if re.match(r'^DayZServer_x64_.*\.adm$', line.split()[-1], re.IGNORECASE)
+            ]
+            if not candidates:
+                return []
 
             latest = max(candidates)
             if latest != self.last_file:
@@ -191,7 +197,8 @@ class FTPLogWatcher:
             self.last_line_count = len(lines)
             self._save_state()
             return [line.strip() for line in new_lines if line.strip()]
-        except: return []
+        except:
+            return []
 
     async def run(self, callback):
         while True:
@@ -218,12 +225,13 @@ watcher = FTPLogWatcher()
 
 async def send_to_discord(msg: str):
     channel = bot.get_channel(DISCORD_CHANNEL_ID)
-    if channel: await channel.send(msg[:1990])
+    if channel:
+        await channel.send(msg[:1990])
 
 @bot.event
 async def on_ready():
     print(f"[Discord] Zalogowano jako {bot.user}")
-    await test_rcon_connection()          # ← NOWY TEST
+    await test_rcon_connection()
     success = await rcon.connect()
     if success:
         print("[RCON] Gotowy do wysyłania wiadomości z Discorda!")
@@ -231,13 +239,16 @@ async def on_ready():
 
 @bot.event
 async def on_message(message):
-    if message.author.bot or message.channel.id != DISCORD_CHANNEL_ID: 
+    if message.author.bot or message.channel.id != DISCORD_CHANNEL_ID:
         return await bot.process_commands(message)
-    
-    content = message.clean_content.strip()
-    if not content: return
 
-    dayz_msg = f"{message.author.display_name}: {content.replace('\"', \"'\")}"
+    content = message.clean_content.strip()
+    if not content:
+        return
+
+    # Poprawiona linia – usunięto błąd składniowy
+    dayz_msg = f"{message.author.display_name}: {content.replace('"', "'")}"
+
     print(f"[Discord → DayZ] {dayz_msg}")
 
     if rcon.connected:
@@ -248,14 +259,18 @@ async def on_message(message):
     await bot.process_commands(message)
 
 # ────────────────────────────────────────────────
-# Flask keep-alive
+# Flask keep-alive (dla Replit / Render)
 # ────────────────────────────────────────────────
 app = Flask(__name__)
-@app.route('/') 
-def home(): return "DayZ ↔ Discord bridge działa"
+
+@app.route('/')
+def home():
+    return "DayZ ↔ Discord bridge działa"
+
 def run_flask():
-    port = int(os.getenv('PORT', 10000))
+    port = int(os.getenv('PORT', 8080))  # Replit lubi 8080
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+
 Thread(target=run_flask, daemon=True).start()
 
 # ────────────────────────────────────────────────

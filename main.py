@@ -177,7 +177,6 @@ class FTPLogWatcher:
             ftp.retrlines('LIST', files.append)
             ftp.quit()
 
-            # Tylko DayZServer_x64_*.adm / *.RPT (ignorujemy wielkość liter)
             pattern = re.compile(r'^DayZServer_x64_.*\.(adm|rpt)$', re.IGNORECASE)
             candidates = [line.split()[-1] for line in files if pattern.match(line.split()[-1])]
 
@@ -189,7 +188,6 @@ class FTPLogWatcher:
                 print("[FTP] Brak plików DayZServer_x64_*.adm / *.RPT")
                 return []
 
-            # Najnowszy plik – sortowanie odwrotne alfabetyczne (data w nazwie)
             latest = sorted(candidates, reverse=True)[0]
             print(f"[FTP] Najnowszy plik: {latest}")
 
@@ -198,7 +196,6 @@ class FTPLogWatcher:
                 self.last_file = latest
                 self.last_line_count = 0
 
-            # Pobieramy zawartość
             ftp = self._ftp_connect()
             buf = io.BytesIO()
             ftp.retrbinary(f'RETR {latest}', buf.write)
@@ -236,15 +233,18 @@ class FTPLogWatcher:
             lines = await self.get_new_lines()
             detected = 0
             for line in lines:
-                # Poprawiony regex – dopasowany do Twojego aktualnego formatu logu
+                # ────────────────────────────────────────────────
+                # Regex dopasowany do aktualnego formatu z .adm:
+                # 14:04:26 | [Chat - Global]("Anu"(id=...)): wiadomość
+                # ────────────────────────────────────────────────
                 m = re.match(
-                    r'^(\d{2}:\d{2}:\d{2})\s*\|\s*\[Chat\s*-\s*(\w+)\]\s*\("([^"]+)"\s*\([^)]+\)\):\s*(.+)$',
+                    r'^(\d{2}:\d{2}:\d{2})\s*\|\s*\[Chat\s*-\s*([^]]+)\]\("([^"]+)"\([^)]+\)\):\s*(.+)$',
                     line,
                     re.IGNORECASE
                 )
                 if m:
                     time, ch_type, nick, msg = m.groups()
-                    ch_type = (ch_type or 'Global').strip()
+                    ch_type = ch_type.strip()
                     formatted = f"[{time}] **{nick}** ({ch_type}): {msg.strip()}"
                     print(f"[CHAT] Wykryto → {formatted}")
                     await callback(formatted)
